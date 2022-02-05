@@ -1,0 +1,4 @@
+vgcore.*
+kernel/*.bin
+kernel/*.enp
+kernel/*.o
