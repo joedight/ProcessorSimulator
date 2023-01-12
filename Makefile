@@ -8,8 +8,8 @@ kernel: $(demos_asm:.s=_asm.bin) $(demos_c:.c=_c.bin)
 
 opt_flags = -O0
 
-sim: simulator.c simulator.h config.h
-	cc -Wall -Wextra -Werror -O2 -Wno-missing-braces -Wno-missing-field-initializers -Wno-unused-parameter -Wno-pointer-arith -std=gnu11 -g $< -o sim
+sim: src/simulator.c src/pipeline.c src/stats.c src/util.c src/config.c src/debugger.c src/alu.c  src/bht.c  src/bru.c  src/btac.c  src/cdb.c  src/lsu.c  src/ras.c  src/rob.c  src/rs.c
+	cc -Wall -Wextra -Werror -O2 -Wno-missing-braces -Wno-missing-field-initializers -Wno-unused-parameter -Wno-pointer-arith -std=gnu11 -g $^ -o sim
 
 %_c.bin %_c.enp: %.c kernel/include/isa.h
 	riscv32-unknown-elf-gcc -specs=nosys.specs -static -ffreestanding -I ${PWD}/kernel/include/ $(opt_flags) -Ttext 0x1000 -g -march=rv32i -o "$*_c.o" $^

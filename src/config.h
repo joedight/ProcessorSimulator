@@ -1,6 +1,11 @@
+#pragma once
+
 #include <stdbool.h>
 
 enum {
+	MEM_SIZE = 1024ul * 1024 * 1024 * 2,
+
+
 	PIPELINE_WIDTH = 4,
 
 	REG_COUNT = 32,
@@ -35,12 +40,13 @@ enum {
 	CDB_WIDTH = PIPELINE_WIDTH,
 };
 
-static bool feature_2level = true;
-static bool feature_store_forward = true;
-static bool feature_branch_bht_btac = true;
+extern bool feature_2level;
+extern bool feature_store_forward;
+extern bool feature_branch_bht_btac;
 
-static bool opt_clearhistoncall = false;
-static bool opt_1bitbht = false;
-static bool opt_nospec = false;
-static bool opt_gshare = false;
-static bool opt_nostorechk = false;
+extern bool opt_clearhistoncall;
+extern bool opt_1bitbht;
+extern bool opt_nospec;
+extern bool opt_gshare;
+extern bool opt_nostorechk;
+

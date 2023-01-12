@@ -1,239 +1,11 @@
-#include "simulator.h"
+#include "pipeline.h"
 
-#include <signal.h>
 #include <stdio.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
-static volatile sig_atomic_t debugger_pause = 1;
-
-word_u lsu_do_op(uint8_t *mem, enum lsu_op op, word_u addr, word_u data_in, bool *exception)
-{
-	uint8_t *buff = mem + addr.u;
-	word_u out = { .u = 0 };
-	addr.u &= ~1u;
-
-	if (addr.u > MEM_SIZE) {
-		if (exception) {
-			*exception = 1;
-			printf("[lsu] Warn invalid mem access, perhaps speculative.\n");
-		} else {
-			printf("[lsu] Invalid mem access to %x\n", addr.u);
-			debugger_pause = 1;
-		}
-		return out;
-	}
-
-	tracei("[lsu] ");
-
-	if (op & LSU_READ_BIT) {
-		tracei("read ");
-		switch (op & LSU_WIDTH_MASK) {
-		case LSU_WIDTH_WORD:
-			out.u |= buff[3] << 24;
-			out.u |= buff[2] << 16;
-			/* fallthrough */
-		case LSU_WIDTH_HALF: 
-			out.u |= buff[1] << 8;
-			/* fallthrough */
-		case LSU_WIDTH_BYTE: 
-			out.u |= buff[0];
-			break;
-		default:
-			assert(0);
-		}
-	} else {
-		assert(op & LSU_WRITE_BIT);
-		tracei("write ");
-		switch (op & LSU_WIDTH_MASK) {
-		case LSU_WIDTH_WORD:
-			buff[3] = data_in.u >> 24;
-			buff[2] = data_in.u >> 16;
-			/* fallthrough */
-		case LSU_WIDTH_HALF: 
-			buff[1] = data_in.u >> 8;
-			/* fallthrough */
-		case LSU_WIDTH_BYTE: 
-			buff[0] = data_in.u;
-			break;
-		default:
-			assert(0);
-		}
-	}
-	switch (op & LSU_WIDTH_MASK) {
-	case LSU_WIDTH_WORD:
-		tracei("word\n");
-		break;
-	case LSU_WIDTH_HALF:
-		tracei("half\n");
-		break;
-	case LSU_WIDTH_BYTE:
-		tracei("byte\n");
-		break;
-	default:
-		assert(0);
-	}
-	return out;
-}
-
-word_u alu_do_op(enum alu_op op, word_u op1, word_u op2)
-{
-	switch (op) {
-	case ALU_OP_ADD:
-		tracei("[ex] ALU: %u + %u (%d + %d)\n", op1.u, op2.u, op1.s, op2.s);
-		return (word_u) { .u = op1.u + op2.u };
-	case ALU_OP_SUB:
-		tracei("[ex] ALU: %d - %d\n", op1.s, op2.s);
-		return (word_u) { .u = op1.u - op2.u };
-	case ALU_OP_SLT:
-		tracei("[ex] ALU: %d < %d\n", op1.s, op2.s);
-		return (word_u) { .u = op1.s < op2.s };
-	case ALU_OP_SLTU:
-		tracei("[ex] ALU: %u < %u\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u < op2.u };
-	case ALU_OP_XOR:
-		tracei("[ex] ALU: %u ^ %u\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u ^ op2.u };
-	case ALU_OP_OR:
-		tracei("[ex] ALU: %u | %u\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u | op2.u };
-	case ALU_OP_AND:
-		tracei("[ex] ALU: %u & %u\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u & op2.u };
-	case ALU_OP_SLL:
-		op2.u &= 0x1F;
-		tracei("[ex] ALU: %u << %u\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u << op2.u };
-	case ALU_OP_SRL:
-		op2.u &= 0x1F;
-		tracei("[ex] ALU: %u >> %u (logical)\n", op1.u, op2.u);
-		return (word_u) { .u = op1.u >> op2.u };
-	case ALU_OP_SRA:
-		op2.u &= 0x1F;
-		tracei("[ex] ALU: %d >> %u (arithmetic)\n", op1.s, op2.u);
-		return (word_u) { .s = op1.s >> op2.u };
-	default:
-		assert(0);
-	}
-}
-
-word_u bru_act_target(const bru_t *bru)
-{
-	const word_u addr_taken = (word_u) { .u = bru->imm.u };
-	assert(~addr_taken.u & 1u);
-	const word_u addr_not = (word_u) { .u = bru->pc.u + 4u };
-	assert(~addr_not.u & 1u);
-	word_u exp;
-
-	switch (bru->op) {
-	case BRU_OP_JALR_TO_ROB:
-	case BRU_OP_JALR_TO_FETCH:
-		tracei("[bru] JALR: %u + %u\n", bru->op1.u, bru->imm.u);
-		exp = (word_u) {.u = (bru->op1.u + bru->imm.u) & ~1u};
-		break;
-	case BRU_OP_EQ:
-		tracei("[bru] CMP: %u == %u", bru->op1.u, bru->op2.u);
-		exp = (bru->op1.u == bru->op2.u) ? addr_taken : addr_not;
-		break;
-	case BRU_OP_NE:
-		tracei("[bru] CMP: %u != %u", bru->op1.u, bru->op2.u);
-		exp = (bru->op1.u != bru->op2.u) ? addr_taken : addr_not;
-		break;
-	case BRU_OP_LT:
-		tracei("[bru] CMP: %d < %d", bru->op1.s, bru->op2.s);
-		exp = (bru->op1.s < bru->op2.s) ? addr_taken : addr_not;
-		break;
-	case BRU_OP_GE:
-		tracei("[bru] CMP: %d >= %d", bru->op1.s, bru->op2.s);
-		exp = (bru->op1.s >= bru->op2.s) ? addr_taken : addr_not;
-		break;
-	case BRU_OP_LTU:
-		tracei("[bru] CMP: %u < %u", bru->op1.u, bru->op2.u);
-		exp = (bru->op1.u < bru->op2.u) ? addr_taken : addr_not;
-		break;
-	case BRU_OP_GEU:
-		tracei("[bru] CMP: %u >= %u", bru->op1.u, bru->op2.u);
-		exp = (bru->op1.u >= bru->op2.u) ? addr_taken : addr_not;
-		break;
-	default:
-		assert(0);
-	}
-
-	if (exp.u != bru->predicted_taddr.u) {
-		if (bru->op == BRU_OP_JALR_TO_FETCH || opt_nospec) {
-			tracei(" (btac miss)\n");
-		} else if (bru->op == BRU_OP_JALR_TO_ROB) {
-			tracei(" (mispredict)\n");
-		} else if (bru->predicted_taddr.u == addr_taken.u) {
-			tracei(" (predicted taken, mispredict)\n");
-		} else if (bru->predicted_taddr.u == addr_not.u) {
-			tracei(" (predicted not taken, mispredict)\n");
-		} else {
-			assert(0);
-		}
-		tracei("[bru] Jmp to %x\n", exp.u);
-	} else {
-		tracei(" (as predicted)\n");
-	}
-	return exp;
-}
-
-void btac_update(state_t *next, word_u pc, word_u taddr)
-{
-	if (opt_nospec)
-		return;
-
-	if (taddr.u) {
-		next->btac[(pc.u / 4) & BTAC_INDEX_MASK].br_pc = pc;
-	} else {
-		next->btac[(pc.u / 4) & BTAC_INDEX_MASK].br_pc = (word_u) { .u = 0 };
-	}
-	next->btac[(pc.u / 4) & BTAC_INDEX_MASK].taddr = taddr;
-}
-
-void bht_btac_update(const state_t *curr, state_t *next, word_u pc, size_t global_history, bool taken, word_u taddr)
-{
-	if (!feature_branch_bht_btac || opt_nospec)
-		return;
-	size_t index = bht_index(pc, global_history);
-	const bht_entry_t *old = &curr->bht[index];
-	bht_entry_t *e = &next->bht[index];
-	if (old->valid) {
-		assert(old->debug_last_pc.u);
-		if (old->debug_last_pc.u != pc.u) {
-			tracei("[BHT] conflict: %x overwrites %x\n", pc.u, old->debug_last_pc.u);
-//			assert(bht_index(old->debug_last_pc, 0) == bht_index(pc, 0));
-			next->stats.bht_conflicts++;
-		}
-
-		uint8_t new_ctr;
-		if (opt_1bitbht) {
-			new_ctr = taken ? 3 : 0;
-		} else {
-			if (taken && old->ctr != 3) {
-				new_ctr = old->ctr + 1;
-			} else if (!taken && old->ctr != 0) {
-				new_ctr = old->ctr - 1;
-			} else {
-				new_ctr = old->ctr;
-			}
-		}
-		tracei("[BHT] %x %staken: %d -> %d\n", pc.u, taken ? "" : "not ", e->ctr, new_ctr);
-		e->ctr = new_ctr;
-	} else {
-		e->valid = 1;
-		e->ctr = taken ? 2 : 1;
-		tracei("[BHT] %x %staken, initialised to %d\n", pc.u, taken ? "" : "not ", e->ctr);
-	}
-	e->debug_last_pc = pc;
-
-	/* BTAC entries stored for predicted-taken branches only (Otherwise fetch just carries on anyway) */
-	if (taken && e->ctr > 1)
-		btac_update(next, pc, taddr);
-	else if (e->ctr < 2)
-		btac_update(next, pc, (word_u){ .u = 0 });
-}
+#include "debugger.h"
 
 void handle_sigint(int _)
 {
@@ -277,281 +49,6 @@ size_t binary_load(char *flName, uint8_t *mem, word_u *entrypoint)
 	}
 	entrypoint->u += BIN_OFFSET;
 	return x;
-}
-
-struct breakpoint {
-	word_u addr;
-//	struct list_head list;
-};
-
-void debugger_print(const state_t *next, const char *arg)
-{
-	if (strcmp(arg, "rob") == 0) {
-		printf("tail: %lu, head: %lu\n", next->rob_tail, next->rob_head);
-		printf("id\tpc\ttype\t\tready\tval\tdest\n");
-		FOR_INDEX_ROB(next, i) {
-			const rob_t *rob = &next->rob[i];
-			printf("%lu\t%x\t%s\t\t %d\t",
-				rob->id,
-				rob->pc.u,
-				rob_type_str(rob->type),
-				rob->ready
-			);
-			switch (rob->type) {
-			case ROB_INSTR_REGISTER:
-				printf("%x\t%s\n", rob->data.reg.val.u,
-					reg_name(rob->data.reg.val.u));
-			break; case ROB_INSTR_STORE:
-				printf("%x\t%x\n", rob->data.reg.val.u,
-					rob->data.reg.val.u);
-			break; case ROB_INSTR_BRANCH:
-				printf("%x\t%x\n", rob->data.brt.pred.u,
-					rob->data.brt.act.u);
-			break; default:
-				printf("\n");
-			}
-		}
-	} else if (strcmp(arg, "reg") == 0) {
-		for (size_t i = 0; i < REG_COUNT; i++) {
-			if ((i & 3) == 0)
-				printf("\n");
-			printf("%5s: %.8x (rs %lu)\t", reg_name(i), next->arf[i].dat.u, next->arf[i].rob_id);
-		}
-		printf("\n");
-	} else if (strcmp(arg, "rs") == 0) {
-		printf("Ldb tail: %lu, head: %lu\n", next->ldb_tail, next->ldb_head);
-		printf("\tpc\ttype\tvk\tqk\t\tvj\tqj\t\n");
-		for (size_t i = 0; i < RS_COUNT + LDB_SIZE; i++) {
-			const rs_t *rs;
-			if (i < RS_COUNT)
-				rs = &next->rss[i];
-			else
-				rs = &next->ldb[i - RS_COUNT];
-			if (rs->busy) {
-				printf("%lu\t%x\t%s\t%lu\t%x\t\t%lu\t%x\n",
-					rs->rob_id, 
-					rs->pc.u,
-					rs_type_str(rs->type),
-					rs->qj, rs->vj.u,
-					rs->qk, rs->vk.u);
-			}
-		}
-	} else if (strcmp(arg, "bht") == 0) {
-		for (size_t i = 0; i < BHT_SIZE; i++) {
-			if (next->bht[i].valid) {
-				printf("%x: %d\n", next->bht[i].debug_last_pc.u, next->bht[i].ctr);
-			}
-		}
-	} else if (strcmp(arg, "ras") == 0) {
-		printf("Head: %lu, %x\n", next->ras_head_ptr, next->ras_head.u);
-		for (size_t i = next->ras_head_ptr; ((i - 1) & RAS_INDEX_MASK) != next->ras_head_ptr; i = (i - 1) & RAS_INDEX_MASK) {
-			printf("%lu - %x\n", i, next->ras[i].raddr.u);
-		}
-	} else {
-		printf("Unknown thing: %s\n", arg);
-	}
-}
-
-int debugger(state_t *next, const uint8_t *mem /*, struct list_head breakpoints */)
-{
-	if (debugger_pause) {
-		printf("PC: %x ish\n", next->pc_last.u);
-	}
-	while (debugger_pause) {
-		fputs("\n>", stdout);
-		fflush(stdout);
-		char cmd = '\0';
-		char arg[32] = { '\0' };
-		char line[32] = { '\0' };
-		fgets(line, 32, stdin);
-		sscanf(line, "%c %31s", &cmd, arg);
-
-		word_u arg_addr;
-		bool arg_addr_v = sscanf(arg, "%x", &arg_addr.u);
-
-		switch (cmd) {
-		case 'n':
-		case '\0':
-		case '\n':
-			return 0;
-		case 'c':
-			debugger_pause = 0;
-			return 0;
-		case 'p':
-			debugger_print(next, arg);
-			break;
-		case 'm':
-			if (arg_addr_v) {
-				printf("%s", &mem[arg_addr.u]);
-			} else {
-				printf("Invalid address: %s", arg);
-			}
-			break;
-		case 'b':
-			if (arg_addr_v) {
-				/*
-				struct breakpoint *bp = NULL;
-				bool flag = 0;
-				list_for_each_entry(bp, &breakpoints, list)
-				{
-					if (bp->addr.u == arg_addr.u) {
-						printf("Unset breakpoint %x\n", arg_addr.u);
-						list_del(&bp->list);
-						free(bp);
-						flag = 1;
-						break;
-					}
-				}
-
-				if (!flag) {
-					printf("Set breakpoint %x\n", arg_addr.u);
-					bp = calloc(1, sizeof(struct breakpoint));
-					bp->addr = arg_addr;
-					list_add(&bp->list, &breakpoints);
-				}
-				*/
-			} else {
-				printf("Invalid breakpoint\n");
-			}
-
-			break;
-		case 's':
-			tracei_enabled = !tracei_enabled;
-			printf(tracei_enabled ? "Debug spew on\n" : "Debug spew off\n");
-			break;
-		case 'q':
-			return 1;
-		}
-	}
-	return 0;
-}
-
-struct per_pc_stats {
-	size_t btac_correct,
-		btac_incorrect,
-		bht_correct,
-		bht_incorrect,
-		static_correct,
-		static_incorrect,
-		miss;
-	enum rob_branch_type type;
-	enum rob_type rob_type;
-
-	size_t retire_stall,
-		arg_stall,
-		ex_stall,
-		issued,
-		retired;
-};
-
-void upd_branch_stats(const rob_t *entry, state_t *next, struct per_pc_stats *per_pc)
-{
-	const word_u pred = entry->data.brt.pred;
-	const word_u act = entry->data.brt.act;
-	struct per_pc_stats tmp;
-	if (!per_pc)
-		per_pc = &tmp;
-	else
-		per_pc = &per_pc[entry->pc.u];
-	per_pc->type = entry->dbg_branch_info.type;
-	switch (entry->dbg_branch_info.type) {
-	case ROB_BRANCH_JAL:
-		if (entry->dbg_branch_info.pred == ROB_PRED_BTAC) {
-			++next->stats.jal_btac_hits;
-			++per_pc->btac_correct;
-		} else if (entry->dbg_branch_info.pred == ROB_PRED_NONE) {
-			++next->stats.jal_btac_miss;
-			++per_pc->miss;
-		} else {
-			assert(0);
-		}
-		break;
-	case ROB_BRANCH_JALR:
-		if (entry->dbg_branch_info.pred == ROB_PRED_NONE) {
-			++next->stats.jalr_btac_miss;
-		} else if (entry->dbg_branch_info.pred == ROB_PRED_RAS) {
-			if (pred.u == act.u) {
-				++next->stats.jalr_ras_correct;
-			} else {
-				++next->stats.jalr_ras_incorrect;
-			}
-		} else if (entry->dbg_branch_info.pred == ROB_PRED_BTAC) {
-			if (pred.u == act.u) {
-				++next->stats.jalr_btac_correct;
-				++per_pc->btac_correct;
-			} else {
-				++next->stats.jalr_btac_incorrect;
-				++per_pc->btac_incorrect;
-			}
-		} else {
-			assert(0);
-		}
-		break;
-	case ROB_BRANCH_CMP:
-		if (entry->dbg_branch_info.pred == ROB_PRED_STATIC || entry->dbg_branch_info.pred == ROB_PRED_NONE) {
-			if (pred.u == act.u) {
-				++next->stats.cmp_static_correct;
-				++per_pc->static_correct;
-			} else {
-				++next->stats.cmp_static_incorrect;
-				++per_pc->static_incorrect;
-			}
-		} else if (entry->dbg_branch_info.pred == ROB_PRED_BHT) {
-			if (pred.u == act.u) {
-				++next->stats.cmp_bht_correct;
-				++per_pc->bht_correct;
-			} else {
-				++next->stats.cmp_bht_incorrect;
-				++per_pc->bht_incorrect;
-			}
-		} else if (entry->dbg_branch_info.pred == ROB_PRED_BTAC) {
-			if (pred.u == act.u) {
-				++next->stats.cmp_btac_correct;
-				++per_pc->btac_correct;
-			} else {
-				++next->stats.cmp_btac_incorrect;
-				++per_pc->btac_incorrect;
-			}
-		} else {
-			assert(0);
-		}
-		break;
-	default:
-		break;
-	}
-}
-
-void ras_do(const state_t *curr, state_t *next)
-{
-	for (size_t i = 0; i < RAS_SIZE; i++) {
-		next->ras[i] = curr->ras[i];
-	}
-
-	switch (curr->ras_cmd) {
-	case RAS_NONE:
-		next->ras_head_ptr = curr->ras_head_ptr;
-		next->ras_head = curr->ras_head;
-		assert(!curr->ras_arg.u);
-		break;
-	case RAS_POP:
-		next->stats.recursion_depth--;
-		assert(!curr->ras_arg.u);
-		next->ras[curr->ras_head_ptr] = (ras_entry_t){ 0 };
-		next->ras_head_ptr = (curr->ras_head_ptr - 1) & RAS_INDEX_MASK;
-		break;
-	case RAS_PUSH:
-		next->stats.recursion_depth++;
-		if (next->stats.recursion_depth > next->stats.recursion_depth_max) {
-			next->stats.recursion_depth_max = next->stats.recursion_depth;
-		}
-		assert(curr->ras_arg.u);
-		next->ras_head_ptr = (curr->ras_head_ptr + 1) & RAS_INDEX_MASK;
-		next->ras[next->ras_head_ptr].raddr = curr->ras_arg;
-		break;
-	default:
-		assert(0);
-	}
-	next->ras_head = next->ras[next->ras_head_ptr].raddr;
 }
 
 int main(int argc, char **argv)
@@ -687,8 +184,8 @@ int main(int argc, char **argv)
 				else
 					new = &next->ldb[i - RS_COUNT];
 				*new = *old;
-				const cdb_t *cdb = NULL;
-				if (old->qj && (cdb = cdb_with_rob(curr, old->qj))) {
+				const cdb_entry *cdb = NULL;
+				if (old->qj && (cdb = cdb_with_rob(&curr->cdb, old->qj))) {
 					tracei("[rs] writeback op1 to %lu from %lu\n", old->rob_id, old->qj);
 					assert(old->busy);
 					new->qj = 0;
@@ -702,13 +199,13 @@ int main(int argc, char **argv)
 							new->addr.u = 0xFFffFFff;
 					}
 				}
-				if (old->qk && (cdb = cdb_with_rob(curr, old->qk))) {
+				if (old->qk && (cdb = cdb_with_rob(&curr->cdb, old->qk))) {
 					tracei("[rs] writeback op2 to %lu from %lu\n", old->rob_id, old->qk);
 					assert(old->busy);
 					new->qk = 0;
 					new->vk = cdb->data;
 				}
-				assert(!cdb_with_rob(curr, old->rob_id));
+				assert(!cdb_with_rob(&curr->cdb, old->rob_id));
 				if (0 == new->qj && 0 == new->qk) {
 					tracei("[rs] %lu ready for ex unit\n", old->rob_id);
 					next->stats.wait_ex++;
@@ -738,7 +235,7 @@ int main(int argc, char **argv)
 				(old->data.reg.dest.u && curr->arf[old->data.reg.dest.u].rob_id));
 			*new = *old;
 
-			const cdb_t *cdb = cdb_with_rob(curr, old->id);
+			const cdb_entry *cdb = cdb_with_rob(&curr->cdb, old->id);
 			if (cdb) {
 				if (old->ready) {
 					printf("rob entry %lu ready: %d but had result on cdb\n",
@@ -830,9 +327,9 @@ int main(int argc, char **argv)
 				bool exception = false;
 				next->fetch_window[i] = (fetched_instr_t) {
 					.pc = pc,
-					.instr = lsu_do_op(mem, LSU_OP_LW, pc, (word_u){ .u = 0 }, &exception),
-					.btac = curr->btac[(pc.u / 4) & BTAC_INDEX_MASK],
-					.bht = curr->bht[bht_index(pc, curr->global_branch_history)],
+					.instr = memory_op(mem, LSU_OP_LW, pc, (word_u){ .u = 0 }, &exception),
+					.btac = curr->btac.buffer[(pc.u / 4) & BTAC_INDEX_MASK],
+					.bht = curr->bht.buffer[bht_index(pc, curr->global_branch_history)],
 				};
 				if (exception) {
 					printf("[warn] Exception on fetch, hope we're speculating. Stalling.\n");
@@ -894,7 +391,7 @@ int main(int argc, char **argv)
 			bool hold_remaining = false;
 			const bool btac_hit = (instr.pc.u == instr.btac.br_pc.u);
 
-			assert(!next->ras_cmd || !opcode);
+			assert(!next->ras.cmd || !opcode);
 
 			next->stats.issued++;
 			if (per_pc_stats)
@@ -1172,8 +669,8 @@ int main(int argc, char **argv)
 					rob_ready(new_rob, target);
 
 					if (is_link_reg(rd) && !opt_nospec) {
-						next->ras_cmd = RAS_PUSH;
-						next->ras_arg.u = instr.pc.u + 4;
+						next->ras.cmd = RAS_PUSH;
+						next->ras.arg.u = instr.pc.u + 4;
 						if (opt_clearhistoncall)
 							next->global_branch_history = 0;
 					}
@@ -1197,15 +694,15 @@ int main(int argc, char **argv)
 					rs_rob_alloc(curr, next, new_rs, new_rob, ROB_INSTR_BRANCH, RS_BR,
 						instr.pc, (word_u){ .u = BRU_OP_JALR_TO_FETCH });
 					new_rob->dbg_branch_info.type = ROB_BRANCH_JALR;
-					if (!is_link_reg(rd) && is_link_reg(rs1) && curr->ras_head.u) {
+					if (!is_link_reg(rd) && is_link_reg(rs1) && curr->ras.head.u) {
 						/* Always pop off stack,
 						 * if BTAC missed/mispredicted, pass back correct PC. */
-						next->ras_cmd = RAS_POP;
+						next->ras.cmd = RAS_POP;
 						new_rs->predicted_taddr = new_rob->data.brt.pred =
-							curr->ras_head;
+							curr->ras.head;
 						new_rs->op.u = BRU_OP_JALR_TO_ROB;
-						if (curr->ras_head.u != instr.btac.taddr.u)
-							next->pc_decode_predict = curr->ras_head;
+						if (curr->ras.head.u != instr.btac.taddr.u)
+							next->pc_decode_predict = curr->ras.head;
 
 						new_rob->branch_ctrl.change_bht = b_set(0);
 						new_rob->branch_ctrl.consider_prediction = b_set(1);
@@ -1303,18 +800,18 @@ int main(int argc, char **argv)
 				break;
 			}
 		}
-		for (size_t i = 0; i < CDB_WIDTH; i++)
-			next->cdb[i] = (cdb_t){ 0 };
+
+		cdb_clear(&next->cdb);
 
 		/* RAS */
-		ras_do(curr, next);
+		ras_do(&curr->ras, &next->ras);
 
 /* Exec. */
 		/* One loop per unit - correspoding to an RS_ type. */
 		for (size_t i = 0; i < ALU_COUNT; i++) {
 			const alu_t *alu = &curr->alus[i];
 			alu_t *new = &next->alus[i];
-			cdb_t *cdb = cdb_find_free(next);
+			cdb_entry *cdb = cdb_find_free(&next->cdb);
 			if (!alu->rob_id || cdb) {
 				const rs_t *rs = rs_waiting_and_free(curr, next, RS_ALU);
 				if (rs) {
@@ -1333,7 +830,7 @@ int main(int argc, char **argv)
 		       	if (alu->rob_id) {
 				if (cdb) {
 					cdb->rob_id = alu->rob_id;
-					cdb->data = alu_do_op(alu->op, alu->op1, alu->op2);
+					cdb->data = alu_result(alu);
 					tracei("[alu] put result (%u %x) into cdb with tag %lu\n",
 							cdb->data.u, cdb->data.u, alu->rob_id);
 				} else {
@@ -1362,7 +859,7 @@ int main(int argc, char **argv)
 					tracei("[ldb] no instr available\n");
 				}
 			} else if (lsu->data_out_set) {
-				cdb_t *cdb = cdb_find_free(next);
+				cdb_entry *cdb = cdb_find_free(&next->cdb);
 				if (cdb) {
 					cdb->rob_id = lsu->rob_id;
 					cdb->exception = lsu->exception;
@@ -1395,7 +892,7 @@ int main(int argc, char **argv)
 					if (lsu->addr.u == 0xFFffFFff) {
 						new->exception = 1;
 					} else {
-						new->data_out = lsu_do_op(mem, lsu->op, lsu->addr, lsu->data_in, &new->exception);
+						new->data_out = memory_op(mem, lsu->op, lsu->addr, lsu->data_in, &new->exception);
 					}
 				}
 			}
@@ -1422,7 +919,7 @@ int main(int argc, char **argv)
 					};
 				}
 			} else {
-				cdb_t *cdb = cdb_find_free(next);
+				cdb_entry *cdb = cdb_find_free(&next->cdb);
 				if (cdb) {
 					word_u act = bru_act_target(bru);
 					cdb->rob_id = bru->rob_id;
@@ -1479,8 +976,10 @@ int main(int argc, char **argv)
 			}
 		}
 /* Retire */
-		memcpy(next->btac, curr->btac, sizeof(curr->btac));
-		memcpy(next->bht, curr->bht, sizeof(curr->bht));
+		next->btac = curr->btac;
+		next->bht = curr->bht;
+//		memcpy(next->btac, curr->btac, sizeof(curr->btac));
+//		memcpy(next->bht, curr->bht, sizeof(curr->bht));
 
 		size_t x = 0;
 		bool flushed = false;
@@ -1558,7 +1057,7 @@ int main(int argc, char **argv)
 					bht_btac_update(curr, next, entry->pc, entry->branch_ctrl.global_history, b_test(taken), act);
 					
 				} else {
-					btac_update(next, entry->pc, act);
+					btac_update(&next->btac, entry->pc, act);
 				}
 				break;
 			} case ROB_INSTR_REGISTER: {
@@ -1594,7 +1093,7 @@ int main(int argc, char **argv)
 					tracei("[commit] note: pc %x store to code region (%x).\n", entry->pc.u, dest.u);
 				}
 				bool exception = false;
-				lsu_do_op(mem, entry->store_op, dest, val, &exception);
+				memory_op(mem, entry->store_op, dest, val, &exception);
 				if (exception) {
 					fprintf(stderr, "[commit] exception attempting write to %x\n", dest.u);
 					debugger_pause = 1 && (!permissive);
@@ -1602,7 +1101,7 @@ int main(int argc, char **argv)
 				break;
 			} case ROB_INSTR_DEBUG: {
 				next->stats.env++;
-				cdb_t *cdb = cdb_find_free(next);
+				cdb_entry *cdb = cdb_find_free(&next->cdb);
 				if (!cdb) {
 					tracei("[dbgu] Wait on CDB for possible wb.\n");
 					retired = false;
@@ -1636,8 +1135,8 @@ int main(int argc, char **argv)
 					printf("[dbgu] bench start at clk %lu\n", next->stats.start_clk);
 					if (trace_pc)
 						trace_pc = freopen(NULL, "wb", trace_pc);
-					memset(next->bht, 0, sizeof(next->bht));
-					memset(next->btac, 0, sizeof(next->btac));
+					next->bht = (struct bht){ 0 };
+					next->btac = (struct btac){ 0 };
 					break;
 				case DBG_OP_BENCH_END:
 					assert(next->stats.start_clk);
@@ -1674,122 +1173,7 @@ int main(int argc, char **argv)
 
 	free(mem);
 	if (curr) {
-		{
-			size_t r = curr->stats.retired,
-			       i = curr->stats.issued,
-			       f = curr->stats.flushed,
-			       c = curr->clk - curr->stats.start_clk,
-			       ib = curr->stats.branches,
-			       il = curr->stats.loads,
-			       is = curr->stats.stores,
-			       ie = curr->stats.env,
-			       ia = curr->stats.arithmetic,
-			       st = curr->stats.stall_mispredict,
-			       
-			       wa = curr->stats.wait_args,
-			       wx = curr->stats.wait_ex,
-			       wc = curr->stats.wait_cdb,
-			       wla = curr->stats.wait_store_addr,
-			       wld = curr->stats.wait_store_data;
-
-			double ipc = (double)r / (double)c,
-				ipc_b = (double)r / (double)(c - st),
-				fw_sz = (double)curr->stats.fetch_window_sum / (double)curr->stats.fetch_window_cnt,
-				waf = (double)wa / (double)i,
-				wxf = (double)wx / (double)i,
-				wcf = (double)wc / (double)i,
-				wlaf = (double)wla / (double)i,
-				wldf = (double)wld / (double)i;
-
-			printf("Benchmark retired %lu and flushed %lu in %lu clocks\n", r, f, c);
-			printf("Issued %lu\n", i);
-			printf("Waited: %lu (%f) for args, %lu (%f) for exec unit, %lu (%f) for cdb, %lu (%f) on store addr, %lu (%f) on store data.\n",
-					wa, waf,
-					wx, wxf,
-					wc, wcf,
-					wla, wlaf,
-					wld, wldf);
-			printf("Spent %lu (%f) cycles stalled from mispredict.\n", st, (double)st / (double)c);
-			printf("IPC: %f (%f excluding mispredict penalty)\n", ipc, ipc_b);
-			printf("Avg decode window: %f\n", fw_sz);
-			printf("Max recursion: %lu\n", curr->stats.recursion_depth_max);
-			const char *fmt = "%s:\t%lu\t(%f%%)\n";
-			printf(fmt, "Loads", il, (double)il*100. / (double)r);
-			printf(fmt, "Stores", is, (double)is*100. / (double)r);
-			printf(fmt, "Branches", ib, (double)ib*100. / (double)r);
-			printf(fmt, "Arithmetic", ia, (double)ia*100. / (double)r);
-			printf(fmt, "Env", ie, (double)ie*100. / (double)r);
-		}
-
-
-		const char *stat_fmt = "\t%s:\t\t%lu (%.1f%%)\t%lu\t%lu\t\t%.2f%%\n";
-
-		printf("\nBranch prediction (possibly limited to benchmark segment):\n");
-		printf("\t\t\tNum\t\tCorrect\tMisspredict\tCorrect predict rate\n");
-		{
-			size_t  h = curr->stats.jal_btac_hits,
-				m = curr->stats.jal_btac_miss,
-				t = h + m;
-			double hr = 100. * (double)h / (double)t,
-			       mr = 100. * (double)m / (double)t;
-			printf("JAL:\n");
-			printf(stat_fmt, "BTAC", h, hr, 0, 0, 0.);
-			printf(stat_fmt, "None", m, mr, 0, 0, 0.);
-		}
-		printf("JALR:\n");
-		{
-			size_t  ac = curr->stats.jalr_btac_correct,
-				rc = curr->stats.jalr_ras_correct,
-				ai = curr->stats.jalr_btac_incorrect,
-				ri = curr->stats.jalr_ras_incorrect,
-				a = ac + ai,
-				r = rc + ri,
-				m = curr->stats.jalr_btac_miss,
-				t = a + m + r;
-			double	ar = 100. * (double)a / (double)t,
-				rr = 100. * (double)r / (double)t,
-				mr = 100. * (double)m / (double)t,
-				acr = 100. * (double)ac / (double)a,
-				rcr = 100. * (double)rc / (double)r;
-			printf(stat_fmt, "BTAC", a, ar, ac, ai, acr);
-			printf(stat_fmt, "RAS ", r, rr, rc, ri, rcr);
-			printf(stat_fmt, "None", m, mr, 0, 0, 0.);
-		}
-		printf("Conditional:\n");
-		{
-			size_t 	c = curr->stats.bht_conflicts,
-
-				hc = curr->stats.cmp_bht_correct,
-				hi = curr->stats.cmp_bht_incorrect,
-				ac = curr->stats.cmp_btac_correct,
-				ai = curr->stats.cmp_btac_incorrect,
-				sc = curr->stats.cmp_static_correct,
-				si = curr->stats.cmp_static_incorrect,
-				tc = hc + ac + sc,
-				ti = hi + ai + si,
-				h = hc + hi,
-				a = ac + ai,
-				s = sc + si,
-				t = h + a + s;
-			double cr = 100. * (double)c / (double)t,
-
-				hr = 100. * (double)h / (double)t,
-				ar = 100. * (double)a / (double)t,
-				sr = 100. * (double)s / (double)t,
-
-				hcr = 100. * (double)hc / (double)h,
-				acr = 100. * (double)ac / (double)a,
-				scr = 100. * (double)sc / (double)s,
-				tcr = 100. * (double)tc / (double)t;
-
-			printf(stat_fmt, "All", t, 100.0, tc, ti, tcr);
-			printf(stat_fmt, opt_nospec ? "None" : "Static", s, sr, sc, si, scr);
-			printf(stat_fmt, "BHT", h, hr, hc, hi, hcr);
-			printf(stat_fmt, "BTAC", a, ar, ac, ai, acr);
-
-			printf("BHT conflicts: %lu / %lu (%f%%)\n", c, t, cr);
-		}
-
+		stats_print(&curr->stats, curr->clk);
 		if (per_pc_stats) {
 			for (size_t pc = 0; pc < bin_size; pc++) {
 				const struct per_pc_stats s = per_pc_stats[pc];
